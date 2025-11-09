@@ -305,6 +305,10 @@ def generate_plan(req: GeneratePlanRequest) -> Plan:
                 for tidx, t in enumerate(terms):
                     if r in t.courses:
                         latest_dep_idx = max(latest_dep_idx, tidx)
+                    # Special case: CHEM 51 requires CHEM 06, but CHEM 11 can substitute
+                    elif cid == "CHEM 51" and r == "CHEM 06":
+                        if "CHEM 11" in t.courses:
+                            latest_dep_idx = max(latest_dep_idx, tidx)
                 if latest_dep_idx >= 0:
                     earliest_allowed_idx = max(earliest_allowed_idx, latest_dep_idx + 1)
         
@@ -1357,46 +1361,129 @@ async def serve_frontend():
             const prerequisites = {
                 'CHEM 06': ['CHEM 05'],
                 'CHEM 51': ['CHEM 06'], // Can be satisfied by CHEM 06 OR CHEM 11
-                'CHEM 52': ['CHEM 51'], // Can be satisfied by CHEM 51 (which can use CHEM 11)
+                'CHEM 52': ['CHEM 51'], // Requires CHEM 51 (which can use CHEM 11)
                 'CHEM 41': ['CHEM 52'],
                 'BIOL 40': ['BIOL 12', 'CHEM 52'],
                 'PHYS 04': ['PHYS 03']
             };
             
+            // Find the current location of the course (if it's already placed)
+            let currentTermIndex = -1;
+            for (let i = 0; i < currentPlan.terms.length; i++) {
+                if (currentPlan.terms[i].courses.includes(courseName)) {
+                    currentTermIndex = i;
+                    break;
+                }
+            }
+            
             const prereqs = prerequisites[courseName];
-            if (!prereqs) return true; // No prerequisites
+            if (!prereqs) {
+                // No prerequisites for this course, but check if moving it would violate prerequisites of courses that come after
+                return checkIfMovingViolatesLaterPrereqs(courseName, targetTermIndex, currentTermIndex);
+            }
             
-            // Check if all prerequisites are satisfied before target term
+            // Collect all courses placed before target term (excluding the course itself if it's already there)
+            const coursesBefore = [];
             for (let i = 0; i < targetTermIndex; i++) {
+                const termCourses = [...currentPlan.terms[i].courses];
+                // If the course is currently in this term, exclude it from the prerequisite check
+                if (i === currentTermIndex) {
+                    const index = termCourses.indexOf(courseName);
+                    if (index !== -1) {
+                        termCourses.splice(index, 1);
+                    }
+                }
+                coursesBefore.push(...termCourses);
+            }
+            
+            // Check if all prerequisites are satisfied
+            for (const prereq of prereqs) {
+                let satisfied = false;
+                
+                // Special case: CHEM 51 can use CHEM 06 OR CHEM 11
+                if (courseName === 'CHEM 51' && prereq === 'CHEM 06') {
+                    if (coursesBefore.includes('CHEM 06') || coursesBefore.includes('CHEM 11')) {
+                        satisfied = true;
+                    }
+                } else {
+                    // Regular prerequisite check
+                    if (coursesBefore.includes(prereq)) {
+                        satisfied = true;
+                    }
+                }
+                
+                if (!satisfied) {
+                    return false; // At least one prerequisite not satisfied
+                }
+            }
+            
+            // Also check if moving this course would violate prerequisites of courses that come after
+            return checkIfMovingViolatesLaterPrereqs(courseName, targetTermIndex, currentTermIndex);
+        }
+        
+        function checkIfMovingViolatesLaterPrereqs(courseName, targetTermIndex, currentTermIndex) {
+            // Check if any course placed in targetTermIndex or AFTER requires courseName as a prerequisite
+            const prerequisites = {
+                'CHEM 06': ['CHEM 05'],
+                'CHEM 51': ['CHEM 06'], // Can be satisfied by CHEM 06 OR CHEM 11
+                'CHEM 52': ['CHEM 51'],
+                'CHEM 41': ['CHEM 52'],
+                'BIOL 40': ['BIOL 12', 'CHEM 52'],
+                'PHYS 04': ['PHYS 03']
+            };
+            
+            // Check all terms from targetTermIndex onwards
+            for (let i = targetTermIndex; i < currentPlan.terms.length; i++) {
                 const term = currentPlan.terms[i];
-                for (const prereq of prereqs) {
-                    if (term.courses.includes(prereq)) {
-                        return true; // Prerequisite found in earlier term
+                for (const courseInTerm of term.courses) {
+                    // Skip if this is the course we're moving (unless it's in a different term)
+                    if (courseInTerm === courseName && i === currentTermIndex) {
+                        continue;
+                    }
+                    
+                    const prereqs = prerequisites[courseInTerm];
+                    if (!prereqs) continue;
+                    
+                    // Check if this course requires courseName as a prerequisite
+                    for (const prereq of prereqs) {
+                        // Special case: CHEM 51 requires CHEM 06, but CHEM 11 can substitute
+                        if (courseInTerm === 'CHEM 51' && prereq === 'CHEM 06') {
+                            // If we're moving CHEM 06 or CHEM 11 to the same term or after CHEM 51, that's invalid
+                            // (unless CHEM 51 already has CHEM 06 or CHEM 11 before it)
+                            if (courseName === 'CHEM 06' || courseName === 'CHEM 11') {
+                                // Check if CHEM 51 has its prerequisite satisfied in terms before it
+                                // (excluding the course we're moving from its current location)
+                                let hasPrereq = false;
+                                for (let j = 0; j < i; j++) {
+                                    const earlierTerm = currentPlan.terms[j];
+                                    const termCourses = [...earlierTerm.courses];
+                                    // Exclude the course we're moving if it's in this term
+                                    if (j === currentTermIndex) {
+                                        const index = termCourses.indexOf(courseName);
+                                        if (index !== -1) {
+                                            termCourses.splice(index, 1);
+                                        }
+                                    }
+                                    if (termCourses.includes('CHEM 06') || termCourses.includes('CHEM 11')) {
+                                        hasPrereq = true;
+                                        break;
+                                    }
+                                }
+                                // If CHEM 51 doesn't have its prerequisite yet, and we're moving CHEM 06/11 to same or later term, that's invalid
+                                if (!hasPrereq) {
+                                    return false;
+                                }
+                            }
+                        } else if (prereq === courseName) {
+                            // This course requires courseName, so courseName must come before it
+                            // If we're moving courseName to the same term or after this course, that's invalid
+                            return false;
+                        }
                     }
                 }
             }
             
-            // Special case: CHEM 51 can use CHEM 11 instead of CHEM 06
-            if (courseName === 'CHEM 51') {
-                for (let i = 0; i < targetTermIndex; i++) {
-                    const term = currentPlan.terms[i];
-                    if (term.courses.includes('CHEM 11')) {
-                        return true; // CHEM 11 satisfies CHEM 51 prerequisite
-                    }
-                }
-            }
-            
-            // Special case: CHEM 52 can use CHEM 51 (which can use CHEM 11)
-            if (courseName === 'CHEM 52') {
-                for (let i = 0; i < targetTermIndex; i++) {
-                    const term = currentPlan.terms[i];
-                    if (term.courses.includes('CHEM 51')) {
-                        return true; // CHEM 51 satisfies CHEM 52 prerequisite
-                    }
-                }
-            }
-            
-            return false; // Prerequisites not satisfied
+            return true;
         }
         
         function hasMutualExclusion(courseName, existingCourses) {
